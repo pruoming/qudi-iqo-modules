@@ -113,6 +113,7 @@ class G2Run:
         self.position = position                              # callable -> scanner position (um) or None
         self.norm_rr = 0.0          # sum of rate_A * rate_B * dt over the accumulation (own normalisation)
         self._deadline = None       # wall-clock limit of the current segment
+        self._check_dark = False
         self.counter = counter
         self.laser = laser
         self.busy = busy or (lambda exclude=frozenset(): dict())
@@ -192,8 +193,8 @@ class G2Run:
             done = float(self.counter.get_data()['capture_s'])
         except Exception:
             done = 0.0
-        # wall-clock limit: twice the remaining run time plus 10 min (refocuses, pauses); then abort
-        self._deadline = now + 2 * max(0.0, self.run_time_s - done) + 600.0
+        self._set_deadline(now, done)
+        self._check_dark = True                 # the dark-start check applies to a start, not to a refocus
         self._low_polls = 0
         self.reason = ''
         self._set('running', 'continued' if resume else 'started')
@@ -274,10 +275,11 @@ class G2Run:
             self.ref_rate = total if self.ref_rate is None else max(self.ref_rate, total)
             if now >= self._ref_until:
                 self._ref_until = None
-                if self.ref_rate < self.min_start_rate_cps:
+                if self._check_dark and self.ref_rate < self.min_start_rate_cps:
                     self._end('aborted', f'count rate {self.ref_rate / 1e3:.2f} kc/s below '
                                          f'{self.min_start_rate_cps / 1e3:.1f} kc/s: laser off or no spot?')
                     return
+                self._check_dark = False
         if self._deadline is not None and now > self._deadline:
             self._end('aborted', 'wall-clock limit exceeded (capture time not advancing?)')
             return
@@ -335,6 +337,7 @@ class G2Run:
             self.ref_rate = 0.9 * self.ref_rate  # new reference: at least 90 % of the old one
             self._ref_until = now + self.ref_window_s
             self._low_polls = 0
+            self._set_deadline(now, float(self.counter.get_data()['capture_s']))   # refocus time not counted
             self._set('running', 'continued after the refocus')
         elif not rf['seen_busy'] and elapsed > self.refocus_start_grace_s:
             self._end('aborted', 'the refocus optimize did not start')
@@ -397,6 +400,10 @@ class G2Run:
         self._restore_pending = False
         self._we_lit = False
         self.laser_note = 'laser switched off again by g2'
+
+    def _set_deadline(self, now, done_s):
+        """ Wall-clock limit of the current segment: twice the remaining run time plus 10 min. """
+        self._deadline = now + 2 * max(0.0, self.run_time_s - done_s) + 600.0
 
     def _position(self):
         try:
