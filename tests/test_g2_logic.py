@@ -208,6 +208,111 @@ class Engine(unittest.TestCase):
         self.step(10)
         self.assertAlmostEqual(self.sim.get_data()['capture_s'], c1 + 10, delta=1.5)
 
+    def test_next_run_keeps_and_releases_g2_laser(self):
+        self.run.start()
+        self.step(5)
+        self.busy.modules['scanning_probe_logic'] = 'locked'
+        self.laser.scanning = True
+        self.step(1)
+        self.assertEqual(self.run.phase, 'aborted')
+        self.assertTrue(self.run.restore_pending)          # laser_off refused during the scan
+        self.busy.modules.clear()
+        self.laser.scanning = False
+        self.laser._on = True                              # still on when the next run starts
+        ok, _ = self.run.start()
+        self.assertTrue(ok)
+        self.assertFalse(self.run.restore_pending)
+        self.step(61)
+        self.assertEqual(self.run.phase, 'finished')
+        self.assertFalse(self.laser.laser_is_on)           # g2 still owns it and switches it off
+
+    def test_counter_error_at_start_restores_laser(self):
+        def broken():
+            raise RuntimeError('counter gone')
+        self.sim.start = broken
+        ok, msg = self.run.start()
+        self.assertFalse(ok)
+        self.assertIn('counter gone', msg)
+        self.assertFalse(self.laser.laser_is_on)
+        self.assertNotEqual(self.run.phase, 'running')
+
+    def test_poll_error_aborts_and_restores_laser(self):
+        self.run.start()
+        self.step(3)
+        def broken():
+            raise RuntimeError('tagger lost')
+        self.sim.get_count_rates = broken
+        self.step(1)
+        self.assertEqual(self.run.phase, 'aborted')
+        self.assertIn('tagger lost', self.run.reason)
+        self.assertFalse(self.laser.laser_is_on)
+
+    def test_laser_off_error_still_ends_run(self):
+        self.run.start()
+        self.step(3)
+        def broken():
+            raise RuntimeError('pulse streamer gone')
+        self.laser.laser_off = broken
+        self.run.stop()
+        self.assertEqual(self.run.phase, 'stopped')
+        self.assertTrue(self.run.restore_pending)
+
+    def _into_refocus(self):
+        self.run.refocus_enabled = True
+        self.run.start()
+        self.step(12)
+        self.sim.rates = np.array([30e3, 34e3])
+        self.step(10)
+        self.assertEqual(self.run.phase, 'refocus')
+        self.step(1)                                       # the fake optimizer reports busy
+
+    def test_other_measurement_during_refocus_aborts_and_stops_optimizer(self):
+        self._into_refocus()
+        self.busy.modules['odmr_logic'] = 'locked'
+        self.step(1)
+        self.assertEqual(self.run.phase, 'aborted')
+        self.assertIn('odmr_logic', self.run.reason)
+        self.assertFalse(self.opt.running)
+
+    def test_operator_stop_during_refocus_stops_optimizer(self):
+        self._into_refocus()
+        self.run.stop()
+        self.assertEqual(self.run.phase, 'stopped')
+        self.assertFalse(self.opt.running)
+
+    def test_refocus_count_is_capped(self):
+        self.run.max_refocus = 2
+        self.run.refocus_enabled = True
+        self.run.start()
+        self.step(12)
+        for _ in range(3):
+            self.sim.rates = self.sim.rates * 0.8          # keeps fading; each refocus fails
+            for _ in range(15):
+                self.step(1)
+                if self.run.phase == 'refocus':
+                    self.step(1)                           # the engine sees the optimize running
+                    self.opt.running = False               # it finishes without effect
+            if self.run.phase == 'aborted':
+                break
+        self.assertEqual(self.run.phase, 'aborted')
+        self.assertIn('after 2 refocuses', self.run.reason)
+
+    def test_reference_is_highest_rate_of_the_first_seconds(self):
+        self.sim.rates = np.array([10e3, 10e3])            # laser still settling
+        self.run.start()
+        self.step(1)
+        self.sim.rates = np.array([40e3, 46e3])
+        self.step(4)
+        self.assertGreater(self.run.ref_rate, 80e3)
+
+    def test_reset_rates(self):
+        self.run.start()
+        self.step(5)
+        self.run.reset_rates()
+        self.assertEqual(self.run.rate_log, [])
+        self.step(2)
+        self.assertEqual(len(self.run.rate_log), 2)
+
     def test_no_laser_gate_logs(self):
         run = G2Run(self.sim, laser=None, clock=self.clock, log=lambda l, m: self.messages.append((l, m)))
         ok, _ = run.start()
