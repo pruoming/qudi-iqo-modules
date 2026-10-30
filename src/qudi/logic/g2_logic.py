@@ -13,8 +13,11 @@ Rules
     optional refocus).
   * Laser: through the confocal scanner's laser_on()/laser_off() (laser_gate connector). The laser state
     before the run is recorded; the laser is switched off at the end only if this module switched it on.
-    If laser_off() is refused (a scan is running), it is retried until it succeeds. Without a laser gate
-    the operator is responsible for the light (logged).
+    If laser_off() is refused (a scan is running), it is retried until it succeeds. laser_off() sets the
+    whole shared Pulse Streamer LOW, so it is never sent while another measurement is busy; the switch-off
+    waits until all are idle. A laser the operator lit is asserted again at the start (its flag can be
+    stale after an ODMR or pulsed run) and left on. Without a laser gate the operator is responsible for
+    the light (logged). A run whose start rate stays below `min_start_rate` is aborted (laser off?).
   * Watchdog on every poll: the run is aborted (data kept and saved, marked "aborted") if another of those
     measurements starts, or if the summed count rate stays below `watchdog_fraction` of the start rate for
     two polls (laser or spot lost: accumulating on would look like background).
@@ -103,9 +106,13 @@ class G2Run:
     def __init__(self, counter, *, laser=None, busy=None, refocus=None, clock=time.monotonic, log=None,
                  run_time_s=600.0, watchdog_fraction=0.3, refocus_enabled=False, refocus_fraction=0.85,
                  refocus_window_s=10.0, refocus_timeout_s=300.0, refocus_start_grace_s=5.0,
-                 ref_window_s=5.0, max_refocus=10):
+                 ref_window_s=5.0, max_refocus=10, min_start_rate_cps=2000.0, position=None):
         self.ref_window_s = float(ref_window_s)
         self.max_refocus = int(max_refocus)
+        self.min_start_rate_cps = float(min_start_rate_cps)   # below: laser off or no spot (dark ~600 c/s)
+        self.position = position                              # callable -> scanner position (um) or None
+        self.norm_rr = 0.0          # sum of rate_A * rate_B * dt over the accumulation (own normalisation)
+        self._deadline = None       # wall-clock limit of the current segment
         self.counter = counter
         self.laser = laser
         self.busy = busy or (lambda exclude=frozenset(): dict())
@@ -135,6 +142,8 @@ class G2Run:
         self._ref_until = None          # the reference rate is still being taken until this time
         self._we_lit = False
         self._restore_pending = False
+        self._off_error_logged = False
+        self._started_wall = None
 
     # ------------------------------------------------------------ control
     @property
@@ -163,6 +172,7 @@ class G2Run:
                 self.counter.clear()
                 self.rate_log = list()
                 self.refocus_log = list()
+                self.norm_rr = 0.0
                 self._t0 = self.clock()
             elif self._t0 is None:
                 self._t0 = self.clock()
@@ -178,6 +188,12 @@ class G2Run:
         self._window_start = now
         self.ref_rate = None
         self._ref_until = now + self.ref_window_s
+        try:
+            done = float(self.counter.get_data()['capture_s'])
+        except Exception:
+            done = 0.0
+        # wall-clock limit: twice the remaining run time plus 10 min (refocuses, pauses); then abort
+        self._deadline = now + 2 * max(0.0, self.run_time_s - done) + 600.0
         self._low_polls = 0
         self.reason = ''
         self._set('running', 'continued' if resume else 'started')
@@ -199,6 +215,7 @@ class G2Run:
             return True, self.laser_note
         if self._we_lit and self.laser.laser_is_on:
             self._restore_pending = False               # still ours from an earlier g2 action
+            self.laser.laser_on()                       # the Pulse Streamer may have been reset meanwhile
             self.laser_note = 'laser kept on by g2 (switched on by an earlier g2 action)'
         elif not self.laser.laser_is_on:
             self.laser.laser_on()
@@ -208,7 +225,10 @@ class G2Run:
             self._restore_pending = False
             self.laser_note = 'laser switched on by g2'
         else:
-            self.laser_note = 'laser was already on (left on at the end)'
+            # the flag says on, but an ODMR or pulsed run since then may have left the Pulse Streamer LOW:
+            # assert the laser again without taking ownership (it stays on at the end)
+            self.laser.laser_on()
+            self.laser_note = 'laser was already on (asserted again; left on at the end)'
         return True, self.laser_note
 
     def release_laser(self):
@@ -220,6 +240,7 @@ class G2Run:
         """ After the histogram was cleared during a run: rates and refocus history start again. """
         self.rate_log = list()
         self.refocus_log = list()
+        self.norm_rr = 0.0
         self._t0 = self.clock()
 
     def poll(self):
@@ -247,10 +268,19 @@ class G2Run:
         self.last_rates = rates
         if dt > 0:
             self.rate_log.append((now - self._t0, total, dt))
+            if rates.size >= 2:
+                self.norm_rr += float(rates[0] * rates[1]) * dt
         if self._ref_until is not None:     # reference: highest rate of the first ref_window_s
             self.ref_rate = total if self.ref_rate is None else max(self.ref_rate, total)
             if now >= self._ref_until:
                 self._ref_until = None
+                if self.ref_rate < self.min_start_rate_cps:
+                    self._end('aborted', f'count rate {self.ref_rate / 1e3:.2f} kc/s below '
+                                         f'{self.min_start_rate_cps / 1e3:.1f} kc/s: laser off or no spot?')
+                    return
+        if self._deadline is not None and now > self._deadline:
+            self._end('aborted', 'wall-clock limit exceeded (capture time not advancing?)')
+            return
         others = self.busy(frozenset())
         if others:
             self._end('aborted', f'{", ".join(sorted(others))} started during the g2 run')
@@ -274,7 +304,7 @@ class G2Run:
                     return
                 self.counter.stop()
                 self._refocus = dict(started=now, at_s=round(now - self._t0, 1), rate_before=mean,
-                                     seen_busy=False)
+                                     seen_busy=False, position_before_um=self._position())
                 self.refocus.start()
                 self._set('refocus', f'refocus: rate {mean / 1e3:.1f} kc/s below '
                                      f'{100 * self.refocus_fraction:.0f} % of {self.ref_rate / 1e3:.1f} kc/s')
@@ -295,6 +325,7 @@ class G2Run:
         elapsed = now - rf['started']
         if rf['seen_busy'] and not busy:
             rf['duration_s'] = round(elapsed, 1)
+            rf['position_after_um'] = self._position()
             self.refocus_log.append({k: v for k, v in rf.items() if k not in ('started', 'seen_busy')})
             self._refocus = None
             self.counter.get_count_rates()      # drop the rates of the refocus time
@@ -336,22 +367,42 @@ class G2Run:
             self.log('error', f'stopping the correlation failed: {exc}')
 
     def _restore_laser(self):
-        """ Switch the laser off if g2 switched it on; stays pending (retried by poll) if refused. """
+        """ Switch the laser off if g2 switched it on; stays pending (retried by poll) if refused.
+
+        laser_off() sets the WHOLE shared Pulse Streamer to all-LOW: it is never called while another
+        measurement (scan, optimize, ODMR, pulsed ODMR, pulsed) is busy, because that would silently kill
+        that measurement's sequence. The switch-off then waits until all of them are idle again. """
         if not self._restore_pending or self.laser is None:
             self._restore_pending = False
+            return
+        try:
+            others = self.busy(frozenset())
+        except Exception:
+            others = {'unknown': 'busy check failed'}
+        if others:
+            self.laser_note = (f'laser switch-off waits: {", ".join(sorted(others))} uses the Pulse Streamer')
             return
         try:
             self.laser.laser_off()
             still_on = self.laser.laser_is_on
         except Exception as exc:
-            self.log('error', f'laser_off failed: {exc}')
+            if not self._off_error_logged:
+                self.log('error', f'laser_off failed: {exc} (retried every poll, logged once)')
+                self._off_error_logged = True
             still_on = True
         if still_on:
             self.laser_note = 'laser_off refused (scan running?); retrying'
             return
+        self._off_error_logged = False
         self._restore_pending = False
         self._we_lit = False
         self.laser_note = 'laser switched off again by g2'
+
+    def _position(self):
+        try:
+            return self.position() if self.position is not None else None
+        except Exception:
+            return None
 
     def _set(self, phase, message):
         self.phase = phase
@@ -380,12 +431,23 @@ class G2Run:
                     restore_pending=self._restore_pending)
 
 
-def evaluate(data, rates, background=None):
+def evaluate(data, rates, background=None, norm_rr=None, refocused=False):
     """ Fit and, with a background rate, rho and the corrected values. data from the counter, rates from
-    G2Run.rate_summary(), background dict(cps, err_cps) or None. """
-    tau_ns = np.asarray(data['tau_ps'], float) / 1e3
-    fit = fit_g2(tau_ns, data['g_norm'], data['counts'])
-    res = dict(fit=fit)
+    G2Run.rate_summary(), background dict(cps, err_cps) or None.
+
+    The Time Tagger normalises with the mean rates of the whole accumulation (N_A N_B / T), which is biased
+    high when the rate changed during the run (refocuses). After a refocus, and when norm_rr (sum of
+    rate_A rate_B dt over the polls, G2Run.norm_rr) is given, the histogram is normalised with it instead. """
+    tau_ps = np.asarray(data['tau_ps'], float)
+    tau_ns = tau_ps / 1e3
+    g = np.asarray(data['g_norm'], float)
+    normalisation = 'counter (mean rates of the whole run)'
+    if refocused and norm_rr and norm_rr > 0 and tau_ps.size > 1:
+        bin_s = float(tau_ps[1] - tau_ps[0]) * 1e-12
+        g = np.asarray(data['counts'], float) / (norm_rr * bin_s)
+        normalisation = 'per-poll rates (rate changed at refocuses)'
+    fit = fit_g2(tau_ns, g, data['counts'])
+    res = dict(fit=fit, normalisation=normalisation)
     if not background or not rates or not rates.get('on_cps'):
         return res
     on, off = rates['on_cps'], float(background['cps'])
@@ -466,6 +528,7 @@ class G2Logic(LogicBase):
     _refocus_window = ConfigOption(name='refocus_window', default=10.0, missing='nothing')
     _refocus_timeout = ConfigOption(name='refocus_timeout', default=300.0, missing='nothing')
     _max_run_time = ConfigOption(name='max_run_time', default=86400.0, missing='nothing')
+    _min_start_rate = ConfigOption(name='min_start_rate', default=2000.0, missing='nothing')   # c/s
 
     _run_time = StatusVar(name='run_time', default=600.0)
     _bin_width_ps = StatusVar(name='bin_width_ps', default=None)
@@ -646,7 +709,7 @@ class G2Logic(LogicBase):
 
     def _fit(self):
         with self._lock:
-            self._result = evaluate(self._counter().get_data(), self._run.rate_summary(), self._background)
+            self._result = self._evaluate(self._counter().get_data())
             self.sigResultUpdated.emit(dict(self._result))
 
     def _save(self, tag):
@@ -656,7 +719,7 @@ class G2Logic(LogicBase):
                 self.log.error('g2: nothing to save (empty histogram)')
                 return
             # always evaluated afresh: the background or the data may have changed since the last fit
-            self._result = evaluate(data, self._run.rate_summary(), self._background)
+            self._result = self._evaluate(data)
             self.sigResultUpdated.emit(dict(self._result))
             try:
                 path = save_g2(self.module_default_data_dir, data, self._metadata(data), self._result,
@@ -723,7 +786,7 @@ class G2Logic(LogicBase):
             return
         data = self._counter().get_data()
         if np.any(data['counts']):
-            self._result = evaluate(data, self._run.rate_summary(), self._background)
+            self._result = self._evaluate(data)
             self.sigResultUpdated.emit(dict(self._result))
 
     def _finish_run(self):
@@ -732,7 +795,7 @@ class G2Logic(LogicBase):
         if not np.any(data['counts']):
             return
         try:
-            self._result = evaluate(data, self._run.rate_summary(), self._background)
+            self._result = self._evaluate(data)
             self.sigResultUpdated.emit(dict(self._result))
         except Exception as exc:
             self.log.error(f'g2 fit failed: {exc}')
@@ -800,7 +863,13 @@ class G2Logic(LogicBase):
                      log=self._log_from_run, run_time_s=float(self._run_time),
                      watchdog_fraction=float(self._watchdog_fraction), refocus_enabled=bool(self._refocus_enabled),
                      refocus_fraction=float(self._refocus_fraction), refocus_window_s=float(self._refocus_window),
-                     refocus_timeout_s=float(self._refocus_timeout))
+                     refocus_timeout_s=float(self._refocus_timeout),
+                     min_start_rate_cps=float(self._min_start_rate), position=self._position_um)
+
+    def _evaluate(self, data):
+        run = self._run
+        return evaluate(data, run.rate_summary(), self._background, norm_rr=run.norm_rr,
+                        refocused=bool(run.refocus_log))
 
     def _log_from_run(self, level, message):
         getattr(self.log, level)(message)

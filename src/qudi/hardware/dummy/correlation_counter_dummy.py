@@ -187,7 +187,7 @@ class CorrelationCounterDummy(CorrelationCounterInterface):
                                    emitters=self._emitters, t1_ns=self._t1_ns, t2_ns=self._t2_ns,
                                    bunching=self._bunching, delay_ns=self._delay_ns)
         self._constraints = CorrelationCounterConstraints(channels=(1, 2, 3, 4, 5, 6, 7, 8),
-                                                          bin_width_ps=(1, 10 ** 9), n_bins=(3, 100001))
+                                                          bin_width_ps=(1, 10 ** 6), n_bins=(3, 100001))
         self.configure(tuple(self._channels), int(self._bin_width_ps), int(self._n_bins))
 
     def on_deactivate(self):

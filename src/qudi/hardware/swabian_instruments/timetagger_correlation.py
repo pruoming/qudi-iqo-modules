@@ -71,7 +71,7 @@ class TimeTaggerCorrelation(CorrelationCounterInterface):
         self._tagger = self._tagger_provider().get_tagger()
         self._constraints = CorrelationCounterConstraints(
             channels=tuple(int(c) for c in self._input_channels),
-            bin_width_ps=(1, 10 ** 9),
+            bin_width_ps=(1, 10 ** 6),       # up to 1 us bins
             n_bins=(3, int(self._max_n_bins)))
         self.configure(tuple(self._channels), int(self._bin_width_ps), int(self._n_bins))
         self.log.info(f'Correlation on the shared Time Tagger, serial {self._tagger.getSerial()}, '

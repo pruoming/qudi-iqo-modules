@@ -313,6 +313,71 @@ class Engine(unittest.TestCase):
         self.step(2)
         self.assertEqual(len(self.run.rate_log), 2)
 
+    def test_no_laser_off_while_another_measurement_uses_the_pulse_streamer(self):
+        self.run.start()
+        self.step(6)
+        self.busy.modules['odmr_logic'] = 'locked'         # ODMR streams its own sequence now
+        self.step(3)
+        self.assertEqual(self.run.phase, 'aborted')
+        self.assertNotIn('off', self.laser.calls)          # laser_off would zero the whole Pulse Streamer
+        self.assertTrue(self.run.restore_pending)
+        self.assertIn('waits', self.run.laser_note)
+        del self.busy.modules['odmr_logic']
+        self.step(1)
+        self.assertIn('off', self.laser.calls)
+        self.assertFalse(self.run.restore_pending)
+
+    def test_stale_laser_flag_is_asserted_again(self):
+        self.laser._on = True                              # flag on, light actually off (Pulse Streamer reset)
+        self.sim.set_excitation(False)
+        ok, _ = self.run.start()
+        self.assertTrue(ok)
+        self.assertIn('on', self.laser.calls)
+        self.assertTrue(self.sim.excitation)
+        self.step(61)
+        self.assertEqual(self.run.phase, 'finished')
+        self.assertTrue(self.laser.laser_is_on)            # not ours: left on
+
+    def test_dark_start_aborts(self):
+        run = G2Run(self.sim, laser=None, clock=self.clock, run_time_s=60)
+        self.sim.set_excitation(False)                     # no light at all: ~600 c/s dark counts
+        run.start()
+        for _ in range(6):
+            self.clock.t += 1
+            run.poll()
+        self.assertEqual(run.phase, 'aborted')
+        self.assertIn('laser off or no spot', run.reason)
+
+    def test_wall_clock_limit(self):
+        self.run.start()
+        self.sim.stop()                                    # capture stalls although the run thinks it runs
+        for _ in range(70):
+            self.step(1, dt=11.0)
+        self.assertEqual(self.run.phase, 'aborted')
+        self.assertIn('wall-clock', self.run.reason)
+
+    def test_refocus_records_positions(self):
+        pos = {'x': 1.0}
+        self.run.position = lambda: dict(pos)
+        self._into_refocus()
+        pos['x'] = 1.2
+        self.opt.running = False
+        self.step(1)
+        rf = self.run.refocus_log[0]
+        self.assertEqual(rf['position_before_um'], {'x': 1.0})
+        self.assertEqual(rf['position_after_um'], {'x': 1.2})
+
+    def test_own_normalisation_after_refocus(self):
+        self.run.start()
+        self.step(30)
+        d = self.sim.get_data()
+        res = evaluate(d, self.run.rate_summary(), None, norm_rr=self.run.norm_rr, refocused=True)
+        self.assertIn('per-poll', res['normalisation'])
+        self.assertIsNotNone(res['fit'])
+        res = evaluate(d, self.run.rate_summary(), None, norm_rr=self.run.norm_rr, refocused=False)
+        self.assertIn('counter', res['normalisation'])
+        self.assertAlmostEqual(self.run.norm_rr / 30, 40e3 * 46e3, delta=0.05 * 40e3 * 46e3)
+
     def test_no_laser_gate_logs(self):
         run = G2Run(self.sim, laser=None, clock=self.clock, log=lambda l, m: self.messages.append((l, m)))
         ok, _ = run.start()
