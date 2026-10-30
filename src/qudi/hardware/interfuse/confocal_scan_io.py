@@ -571,6 +571,12 @@ class ConfocalScanIO(FiniteSamplingIOInterface):
 
     # ---------------------------------------------------------------- console helpers
 
+    @property
+    def laser_is_on(self):
+        """ True while a laser_on() is in force (read-only; the laser is held HIGH between and during
+        scans until laser_off()). Lets other modules (g2_logic) restore the operator's laser state. """
+        return bool(self._laser_is_on)
+
     def laser_on(self):
         """ HUMAN console action (standing laser approval): hold the laser gate HIGH via a
         constant Pulse Streamer state. Works on a borrowed PS too — an explicit human call is
