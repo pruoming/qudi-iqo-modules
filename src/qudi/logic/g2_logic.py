@@ -431,10 +431,12 @@ def save_g2(root_dir, data, metadata, result, tag='', timestamp=None):
     fig = Figure(figsize=(10, 4))
     for ax, span in zip(fig.subplots(1, 2), (None, 50.0)):
         sel = np.ones(tau_ns.size, bool) if span is None else np.abs(tau_ns - (fit or {}).get('t0_ns', 0)) <= span
-        ax.plot(tau_ns[sel], g[sel], '.', ms=2, color='C0', label='data')
+        # explicit styles: qudi's matplotlib style would add markers and change the colour cycle (desk test)
+        ax.plot(tau_ns[sel], g[sel], linestyle='none', marker='.', markersize=2, color='#1f77b4', label='data')
         if fit:
             ax.plot(tau_ns[sel], model(tau_ns[sel], fit['level'], 1 - fit['g2_0'], fit['a'], fit['t1_ns'],
-                                       fit['t2_ns'], fit['t0_ns'], fit['sigma_ns']), color='C3', label='fit')
+                                       fit['t2_ns'], fit['t0_ns'], fit['sigma_ns']),
+                    linestyle='-', marker='', linewidth=1.5, color='#d62728', label='fit')
         ax.set_xlabel('tau (ns)')
         ax.set_ylabel('g2 (normalised)')
     if fit:
