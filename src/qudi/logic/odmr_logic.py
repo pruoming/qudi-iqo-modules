@@ -26,7 +26,8 @@ import datetime
 import matplotlib.pyplot as plt
 from PySide6 import QtCore
 
-from qudi.util.datafitting import FitContainer, FitConfigurationsModel
+from qudi.util.datafitting import FitConfigurationsModel
+from qudi.util.fit_derived import DerivedFitContainer
 from qudi.core.module import LogicBase
 from qudi.util.mutex import RecursiveMutex
 from qudi.util.units import ScaledFloat
@@ -52,6 +53,12 @@ class OdmrLogic(LogicBase):
             data_scanner: <data_scanner_name>
         options:
             default_scan_mode: 'JUMP_LIST'  # optional
+            reference_channel: 'fluorescence_ref'  # optional; see below
+
+    reference_channel: name of a data scanner channel (e.g. the mw-OFF reference of
+    OdmrScanInput scan_mode 'norm'). When set, every other channel's signal is its
+    sweep-averaged rate divided by the sweep-averaged reference rate (ratio of means), so the
+    baseline is 1 and a dip of depth C means contrast C. Raw data stays in the scanner units.
     """
 
     # declare connectors
@@ -63,6 +70,7 @@ class OdmrLogic(LogicBase):
     _default_scan_mode = ConfigOption(name='default_scan_mode',
                                       default='JUMP_LIST',
                                       constructor=lambda x: SamplingOutputMode[x.upper()])
+    _reference_channel = ConfigOption(name='reference_channel', default=None)
 
     # declare status variables
     _cw_frequency = StatusVar(name='cw_frequency', default=2870e6)
@@ -126,6 +134,7 @@ class OdmrLogic(LogicBase):
         self._signal_data = None
         self._frequency_data = None
         self._fit_results = None
+        self._norm_ref = None   # reference channel actually used for normalization
 
     def on_activate(self):
         """
@@ -150,10 +159,21 @@ class OdmrLogic(LogicBase):
         # ToDo: Check against data sampler constraints
         # self._data_rate =
 
+        self._norm_ref = None
+        if self._reference_channel:
+            if self._reference_channel in data_constraints.channel_names:
+                self._norm_ref = self._reference_channel
+            else:
+                self.log.warning(f'reference_channel "{self._reference_channel}" is not a data '
+                                 f'scanner channel {list(data_constraints.channel_names)}; '
+                                 f'signals are not normalized.')
+
         # Set up fit model and container
         self._fit_config_model = FitConfigurationsModel(parent=self)
         self._fit_config_model.load_configs(self._fit_configs)
-        self._fit_container = FitContainer(parent=self, config_model=self._fit_config_model)
+        # results also show linewidth (FWHM) and contrast of line fits (2026-10-24)
+        self._fit_container = DerivedFitContainer(parent=self, config_model=self._fit_config_model,
+                                                  x_unit='Hz')
 
         # Elapsed measurement time and number of sweeps
         self._elapsed_time = 0.0
@@ -227,6 +247,42 @@ class OdmrLogic(LogicBase):
                 else:
                     self._signal_data[channel][range_index] = np.mean(masked_raw_data,
                                                                       axis=1).compressed()
+        self._normalize_signal_data()
+
+    def _normalize_signal_data(self):
+        """ Ratio of means: divide every non-reference channel's sweep-averaged signal by the
+        sweep-averaged reference. Points without reference counts (no data yet) read 0. """
+        ref = self._norm_ref
+        if ref is None or ref not in self._signal_data:
+            return
+        for channel, signal_list in self._signal_data.items():
+            if channel == ref:
+                continue
+            for range_index, signal in enumerate(signal_list):
+                ref_signal = self._signal_data[ref][range_index]
+                if signal.shape != ref_signal.shape:
+                    self._signal_data[channel][range_index] = np.zeros(signal.shape)
+                    continue
+                with np.errstate(divide='ignore', invalid='ignore'):
+                    self._signal_data[channel][range_index] = np.where(ref_signal > 0,
+                                                                       signal / ref_signal,
+                                                                       0.0)
+
+    @property
+    def reference_channel(self):
+        """ Channel the other signals are normalized to, or None. """
+        return self._norm_ref
+
+    @property
+    def signal_units(self):
+        """ Units of signal_data per channel: '' (ratio) for normalized channels. Raw data keeps
+        the data scanner units (data_constraints.channel_units). """
+        units = dict(self.data_constraints.channel_units)
+        if self._norm_ref is not None:
+            for channel in units:
+                if channel != self._norm_ref:
+                    units[channel] = ''
+        return units
 
     @property
     def fit_config_model(self):
@@ -510,38 +566,12 @@ class OdmrLogic(LogicBase):
                 self.sigScanStateUpdated.emit(True)
                 return
 
-            microwave = self._microwave()
-            sampler = self._data_scanner()
-
             self.toggle_cw_output(False)
             self.module_state.lock()
 
             # Set up hardware
             try:
-                sample_rate = self._oversampling_factor * self._data_rate
-                # switch scan mode if necessary
-                if self._default_scan_mode != SamplingOutputMode.JUMP_LIST and len(
-                        self._scan_frequency_ranges) > 1:
-                    mode = SamplingOutputMode.JUMP_LIST
-                    self.log.info('Multiple ODMR scan ranges set up. Trying to switch scanner to '
-                                  'output mode "JUMP_LIST".')
-                else:
-                    mode = self._default_scan_mode
-                if mode == SamplingOutputMode.JUMP_LIST:
-                    frequencies = np.concatenate(self._frequency_data)
-                    if self._oversampling_factor > 1:
-                        frequencies = np.repeat(frequencies, self._oversampling_factor)
-                    samples = len(frequencies)
-                elif mode == SamplingOutputMode.EQUIDISTANT_SWEEP:
-                    frequencies = self._scan_frequency_ranges[0]
-                    samples = frequencies[-1]
-
-                # Set up data acquisition device
-                sampler.set_sample_rate(sample_rate)
-                sampler.set_frame_size(samples)
-                # Set up microwave scan and start it
-                microwave.configure_scan(self._scan_power, frequencies, mode, sample_rate)
-                microwave.start_scan()
+                self._arm_scan_hardware()
             except:
                 self.module_state.unlock()
                 self.log.exception('Unable to start ODMR scan. Error while setting up hardware:')
@@ -557,6 +587,37 @@ class OdmrLogic(LogicBase):
             self.sigScanStateUpdated.emit(True)
             self._start_time = time.time()
             self._sigNextLine.emit()
+
+    def _arm_scan_hardware(self):
+        """ Configure the data scanner and the microwave scan for the current scan settings and
+        start the microwave scan. Shared by start_odmr_scan and continue_odmr_scan.
+        """
+        microwave = self._microwave()
+        sampler = self._data_scanner()
+        sample_rate = self._oversampling_factor * self._data_rate
+        # switch scan mode if necessary
+        if self._default_scan_mode != SamplingOutputMode.JUMP_LIST and len(
+                self._scan_frequency_ranges) > 1:
+            mode = SamplingOutputMode.JUMP_LIST
+            self.log.info('Multiple ODMR scan ranges set up. Trying to switch scanner to '
+                          'output mode "JUMP_LIST".')
+        else:
+            mode = self._default_scan_mode
+        if mode == SamplingOutputMode.JUMP_LIST:
+            frequencies = np.concatenate(self._frequency_data)
+            if self._oversampling_factor > 1:
+                frequencies = np.repeat(frequencies, self._oversampling_factor)
+            samples = len(frequencies)
+        elif mode == SamplingOutputMode.EQUIDISTANT_SWEEP:
+            frequencies = self._scan_frequency_ranges[0]
+            samples = frequencies[-1]
+
+        # Set up data acquisition device
+        sampler.set_sample_rate(sample_rate)
+        sampler.set_frame_size(samples)
+        # Set up microwave scan and start it
+        microwave.configure_scan(self._scan_power, frequencies, mode, sample_rate)
+        microwave.start_scan()
 
     def clear_all_fits(self):
         for channel, range_data in self._raw_data.items():
@@ -576,8 +637,23 @@ class OdmrLogic(LogicBase):
                 self.sigScanStateUpdated.emit(True)
                 return
 
-            # ToDo: see start_odmr_scan
+            if self._elapsed_sweeps == 0:
+                # nothing to continue: behave like a fresh start
+                self.start_odmr_scan()
+                return
+
+            # stop_odmr_scan switched the microwave off: re-arm the microwave scan and the sampler
+            # exactly as start_odmr_scan does, but keep the accumulated data (fix 2026-10-10,
+            # RUN-CONFOCAL-NV-ODMR-RESUME-20261010; before, resumed sweeps ran with RF off).
+            self.toggle_cw_output(False)
             self.module_state.lock()
+            try:
+                self._arm_scan_hardware()
+            except:
+                self.module_state.unlock()
+                self.log.exception('Unable to continue ODMR scan. Error while setting up hardware:')
+                self.sigScanStateUpdated.emit(False)
+                return
 
             self.sigScanStateUpdated.emit(True)
             self._start_time = time.time() - self._elapsed_time
@@ -708,10 +784,12 @@ class OdmrLogic(LogicBase):
                     'Data Rate (Hz)': self._data_rate,
                     'Oversampling factor (Hz)': self._oversampling_factor,
                     'Channel Name': ''}
+        if self._norm_ref is not None:
+            metadata['Signal normalized to channel'] = self._norm_ref
         for fit_channel in self._fit_results:
             for ii, fit_result in enumerate(self._fit_results[fit_channel]):
                 if fit_result:
-                    export_dict = FitContainer.dict_result(fit_result[1])
+                    export_dict = self._fit_container.dict_result(fit_result[1])
                     metadata[f'fit result (channel "{fit_channel}" range {ii})'] = export_dict
         return metadata
 
@@ -722,7 +800,11 @@ class OdmrLogic(LogicBase):
     def _get_signal_column_headers(self):
         channel_units = self.data_constraints.channel_units
         column_headers = ['Frequency (Hz)']
-        column_headers.extend(f'{ch} ({channel_units[ch]})' for ch in self._signal_data)
+        for ch in self._signal_data:
+            if self._norm_ref is not None and ch != self._norm_ref:
+                column_headers.append(f'{ch} (ratio to {self._norm_ref})')
+            else:
+                column_headers.append(f'{ch} ({channel_units[ch]})')
         return tuple(column_headers)
 
     def _join_channel_raw_data(self, channel):
@@ -810,15 +892,18 @@ class OdmrLogic(LogicBase):
         fit_result = self._fit_results[channel][range_index]
         if fit_result is not None:
             fit_x, fit_y = fit_result[1].high_res_best_fit
-        unit = self.data_constraints.channel_units[channel]
+        raw_unit = self.data_constraints.channel_units[channel]
+        normalized = self._norm_ref is not None and channel != self._norm_ref
 
-        # Determine SI unit scaling for signal
-        scaled = ScaledFloat(np.max(signal_data))
-        signal_unit_prefix = scaled.scale
-        if signal_unit_prefix:
-            signal_data = signal_data / scaled.scale_val
-            if fit_result is not None:
-                fit_y = fit_y / scaled.scale_val
+        # Determine SI unit scaling for signal (a normalized ratio is shown unscaled)
+        signal_unit_prefix = ''
+        if not normalized:
+            scaled = ScaledFloat(np.max(signal_data))
+            signal_unit_prefix = scaled.scale
+            if signal_unit_prefix:
+                signal_data = signal_data / scaled.scale_val
+                if fit_result is not None:
+                    fit_y = fit_y / scaled.scale_val
 
         # Determine SI unit scaling for frequency axis
         scaled = ScaledFloat(np.max(freq_data))
@@ -842,7 +927,10 @@ class OdmrLogic(LogicBase):
         # Include fit curve if there is one
         if fit_result is not None:
             ax_signal.plot(fit_x, fit_y, marker='None')
-        ax_signal.set_ylabel(f'{channel} ({signal_unit_prefix}{unit})')
+        if normalized:
+            ax_signal.set_ylabel(f'{channel} / {self._norm_ref}')
+        else:
+            ax_signal.set_ylabel(f'{channel} ({signal_unit_prefix}{raw_unit})')
         ax_signal.set_xlim(min(freq_data), max(freq_data))
 
         # plot raw data
@@ -866,7 +954,7 @@ class OdmrLogic(LogicBase):
         colorbar_ax = fig.add_axes([0.85, 0.15, 0.02, 0.7])
         # Draw colorbar
         colorbar = fig.colorbar(raw_data_plot, cax=colorbar_ax)
-        colorbar.set_label(f'{channel} ({signal_unit_prefix}{unit})')
+        colorbar.set_label(f'{channel} ({raw_unit_prefix}{raw_unit})')
         # remove ticks from colorbar for cleaner image
         colorbar.ax.tick_params(which=u'both', length=0)
         # If we have percentile information, draw that to the figure

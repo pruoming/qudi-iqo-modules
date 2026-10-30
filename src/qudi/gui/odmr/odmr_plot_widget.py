@@ -91,9 +91,12 @@ class OdmrPlotWidget(QtWidgets.QWidget):
         self._colorbar.sigPercentilesChanged.connect(self._colorbar_percentiles_changed)
         main_layout.addWidget(self._colorbar, 0, 1, 2, 1)
 
-    def set_signal_label(self, channel, unit):
-        self._plot_widget.setLabel('left', text=channel, units=unit)
-        self._colorbar.set_label(text=channel, unit=unit)
+    def set_signal_label(self, channel, unit, image_unit=None, signal_text=None):
+        """ Label the signal plot and the raw-data colorbar. For a normalized (unitless) signal
+        over raw data in c/s, pass signal_text and image_unit for the raw image. """
+        self._plot_widget.setLabel('left', text=channel if signal_text is None else signal_text,
+                                   units=unit)
+        self._colorbar.set_label(text=channel, unit=unit if image_unit is None else image_unit)
 
     def set_data(self, frequency, image=None, signal=None, fit=None):
         if image is not None:

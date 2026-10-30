@@ -428,7 +428,13 @@ class OdmrGui(GuiBase):
             range_index = self._scan_control_dockwidget.selected_range
         logic = self._odmr_logic()
         channel_unit = logic.data_constraints.channel_units[channel]
-        self._plot_widget.set_signal_label(channel, channel_unit)
+        reference = logic.reference_channel
+        if reference is not None and channel != reference:
+            # normalized signal: unitless ratio; the raw image keeps the scanner unit
+            self._plot_widget.set_signal_label(channel, '', image_unit=channel_unit,
+                                               signal_text=f'{channel} / {reference}')
+        else:
+            self._plot_widget.set_signal_label(channel, channel_unit)
         self._update_scan_data()
         fit_cfg_result = logic.fit_results[channel][range_index]
         self._update_fit_result(fit_cfg_result, channel, range_index)

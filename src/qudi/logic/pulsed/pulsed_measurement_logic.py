@@ -32,7 +32,8 @@ from qudi.core.statusvariable import StatusVar
 from qudi.core.module import LogicBase
 from qudi.util.mutex import Mutex
 from qudi.util.network import netobtain
-from qudi.util.datafitting import FitConfigurationsModel, FitContainer
+from qudi.util.datafitting import FitConfigurationsModel
+from qudi.util.fit_derived import DerivedFitContainer
 from qudi.util.math import compute_ft
 from qudi.util.datastorage import TextDataStorage, CsvDataStorage, NpyDataStorage
 from qudi.util.units import ScaledFloat
@@ -126,6 +127,8 @@ class PulsedMeasurementLogic(LogicBase):
 
     # Data fitting
     _fit_configs = StatusVar(name='fit_configs', default=None)
+    # version of the default fit list the saved list was migrated to (see _migrate_fit_configs)
+    _fit_list_version = StatusVar(name='fit_list_version', default=0)
 
     # alternative signal computation settings:
     _alternative_data_type = StatusVar(default=None)
@@ -150,54 +153,13 @@ class PulsedMeasurementLogic(LogicBase):
     sigStartTimer = QtCore.Signal()
     sigStopTimer = QtCore.Signal()
 
+    # pulse-sequence fits only (Rabi, Ramsey, echo, T1); line-shape fits are retired (P1,
+    # 2026-10-24): pulsed ODMR is fitted in the pulsed ODMR window. Version 3: the standard
+    # 'Exp. Decay' (Hahn echo, T1) is added to saved lists that lack it.
+    __fit_list_version = 3
     __default_fit_configs = (
-        {'name': 'Gaussian Dip',
-         'model': 'Gaussian',
-         'estimator': 'Dip',
-         'custom_parameters': None},
-
-        {'name': 'Gaussian Peak',
-         'model': 'Gaussian',
-         'estimator': 'Peak',
-         'custom_parameters': None},
-
-        {'name': 'Lorentzian Dip',
-         'model': 'Lorentzian',
-         'estimator': 'Dip',
-         'custom_parameters': None},
-
-        {'name': 'Lorentzian Peak',
-         'model': 'Lorentzian',
-         'estimator': 'Peak',
-         'custom_parameters': None},
-
-        {'name': 'Double Lorentzian Dips',
-         'model': 'DoubleLorentzian',
-         'estimator': 'Dips',
-         'custom_parameters': None},
-
-        {'name': 'Double Lorentzian Peaks',
-         'model': 'DoubleLorentzian',
-         'estimator': 'Peaks',
-         'custom_parameters': None},
-
-        {'name': 'Triple Lorentzian Dip',
-         'model': 'TripleLorentzian',
-         'estimator': 'Dips',
-         'custom_parameters': None},
-
-        {'name': 'Triple Lorentzian Peaks',
-         'model': 'TripleLorentzian',
-         'estimator': 'Peaks',
-         'custom_parameters': None},
-
         {'name': 'Sine',
          'model': 'Sine',
-         'estimator': 'default',
-         'custom_parameters': None},
-
-        {'name': 'Double Sine',
-         'model': 'DoubleSine',
          'estimator': 'default',
          'custom_parameters': None},
 
@@ -211,11 +173,30 @@ class PulsedMeasurementLogic(LogicBase):
          'estimator': 'Stretched Decay',
          'custom_parameters': None},
 
+        {'name': 'Double Sine',
+         'model': 'DoubleSine',
+         'estimator': 'default',
+         'custom_parameters': None},
+
+        {'name': 'Exp. Decay',
+         'model': 'ExponentialDecay',
+         'estimator': 'Decay',
+         'custom_parameters': None},
+
         {'name': 'Stretched Exp. Decay',
          'model': 'ExponentialDecay',
          'estimator': 'Stretched Decay',
          'custom_parameters': None},
     )
+    # (name, model, estimator) of former defaults removed from a saved fit list (unmodified only)
+    __retired_fit_configs = (('Gaussian Dip', 'Gaussian', 'Dip'),
+                             ('Gaussian Peak', 'Gaussian', 'Peak'),
+                             ('Lorentzian Dip', 'Lorentzian', 'Dip'),
+                             ('Lorentzian Peak', 'Lorentzian', 'Peak'),
+                             ('Double Lorentzian Dips', 'DoubleLorentzian', 'Dips'),
+                             ('Double Lorentzian Peaks', 'DoubleLorentzian', 'Peaks'),
+                             ('Triple Lorentzian Dip', 'TripleLorentzian', 'Dips'),
+                             ('Triple Lorentzian Peaks', 'TripleLorentzian', 'Peaks'))
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -267,10 +248,21 @@ class PulsedMeasurementLogic(LogicBase):
                                               QtCore.Qt.ConnectionType.QueuedConnection)
 
         # Fitting
+        try:
+            saved_version = int(self._fit_list_version or 0)
+        except (TypeError, ValueError):
+            saved_version = 0       # odd saved value: migrate (idempotent) rather than fail
+        if saved_version < self.__fit_list_version:
+            self._fit_configs = self._migrate_fit_configs(self._fit_configs, saved_version)
+            self._fit_list_version = self.__fit_list_version
         self.fit_config_model = FitConfigurationsModel(parent=self)
         self.fit_config_model.load_configs(self._fit_configs)
-        self.fc = FitContainer(parent=self, config_model=self.fit_config_model)
-        self.alt_fc = FitContainer(parent=self, config_model=self.fit_config_model)
+        # results also show pi, pi/2, 3pi/2 and the Rabi period of Rabi fits (and linewidth /
+        # contrast of line fits) (2026-10-24)
+        self.fc = DerivedFitContainer(parent=self, config_model=self.fit_config_model,
+                                      x_unit=lambda: (self._data_units or ("",))[0])
+        self.alt_fc = DerivedFitContainer(parent=self, config_model=self.fit_config_model,
+                                          x_unit=lambda: (self._data_units or ("",))[0])
 
         # Turn off pulse generator
         self.pulse_generator_off()
@@ -335,6 +327,39 @@ class PulsedMeasurementLogic(LogicBase):
         if not value:
             return self.__default_fit_configs
         return value
+
+    def _migrate_fit_configs(self, value, from_version=0):
+        """ One-time migration (on activation while fit_list_version is older than the current
+        default list) of a saved fit list, step by step from the saved version:
+          < 2: unmodified retired defaults are removed; a list that is otherwise unchanged
+               defaults becomes the current default list;
+          < 3: the standard 'Exp. Decay' (Hahn echo, T1) is added if missing.
+        The result is put in the default order, custom parameters and own fits kept (own fits
+        last). Later changes by the user (deleted or re-added fits) are left alone, as the
+        version is saved. """
+        try:
+            def key(cfg):
+                return cfg.get('name'), cfg.get('model'), cfg.get('estimator')
+
+            def retired(cfg):
+                return key(cfg) in self.__retired_fit_configs and cfg.get('custom_parameters') is None
+
+            configs = [cfg for cfg in (value or ()) if isinstance(cfg, dict)]
+            stock = {key(cfg): cfg for cfg in self.__default_fit_configs}
+            defaults = list(stock)
+            if from_version < 2:
+                configs = [cfg for cfg in configs if not retired(cfg)]
+                if all(key(cfg) in stock and cfg.get('custom_parameters') is None
+                       for cfg in configs):
+                    return self.__default_fit_configs
+            if from_version < 3:
+                exp_decay = ('Exp. Decay', 'ExponentialDecay', 'Decay')
+                if exp_decay[0] not in {cfg.get('name') for cfg in configs}:   # no duplicate name
+                    configs = configs + [dict(stock[exp_decay])]
+            return sorted(configs, key=lambda cfg: defaults.index(key(cfg)) if key(cfg) in stock
+                          else len(defaults))
+        except Exception:
+            return value     # odd saved data: load as stock qudi does (bad entries are skipped)
 
     ############################################################################
     # Fast counter control methods and properties
@@ -1396,10 +1421,10 @@ class PulsedMeasurementLogic(LogicBase):
                     'generation parameters'       : self.sampling_information.get('generation_parameters'),
                     'generation method parameters': self.generation_method_parameters}
         if self._fit_result:
-            export_dict = FitContainer.dict_result(self._fit_result)
+            export_dict = self.fc.dict_result(self._fit_result)
             metadata['fit result'] = export_dict
         if self._fit_result_alt:
-            export_dict = FitContainer.dict_result(self._fit_result_alt)
+            export_dict = self.alt_fc.dict_result(self._fit_result_alt)
             metadata['fit result alt'] = export_dict
         return metadata
 

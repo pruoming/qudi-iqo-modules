@@ -27,6 +27,11 @@ Per-point sequence (advance_at_start=True, default):
                Readout = rate(A) - rate(B): the slow PL bleaching baseline common to both
                windows cancels, leaving a flat ~0 baseline + the resonance dip.
                NOTE: diff values are NEGATIVE-capable by design.
+    norm mode: same sequence as diff (2 windows/point), but TWO channels are returned:
+               <input_channel_name> = rate(A) (mw ON) and <reference_channel_name> =
+               rate(B) (mw OFF, same point). OdmrLogic with reference_channel set divides the
+               SWEEP-AVERAGED channels (ratio of means): baseline 1, dip depth = contrast. A
+               per-point ratio would be biased by ~1/N counts per window, so it is not done here.
 
 mw_settle_time is the dwell after the SMIQ frequency advance before counting — the REAL rate
 limiter (ODMR-001: the SMIQ settle takes ~ms; raise this / lower the data rate if the dip
@@ -133,6 +138,8 @@ class OdmrScanInput(FiniteSamplingInputInterface):
     _apd_channels = ConfigOption(name='apd_channels', default=[1, 2])
     _detect_tt_channel = ConfigOption(name='detect_tt_channel', default=5)
     _input_channel_name = ConfigOption(name='input_channel_name', default='fluorescence')
+    # norm mode only: name of the mw-OFF reference channel ('' -> '<input_channel_name>_ref').
+    _reference_channel_name = ConfigOption(name='reference_channel_name', default='')
 
     # --- Per-point sequence timing ---
     # Dwell after the SMIQ advance before counting (SMIQ frequency settle, ~ms — the real
@@ -143,6 +150,8 @@ class OdmrScanInput(FiniteSamplingInputInterface):
     # --- Measurement mode ---
     # 'sum' = raw PL vs frequency (1 window/point; shows the bleaching baseline).
     # 'diff' = per point rate(mw ON) - rate(mw OFF) (2 windows/point; cancels the baseline).
+    # 'norm' = diff sequence, returns rate(mw ON) and rate(mw OFF) as two channels; pair with
+    #          OdmrLogic reference_channel for a contrast signal with baseline 1.
     _scan_mode = ConfigOption(name='scan_mode', default='sum')
     # sum mode only: hold the mw switch OPEN for the whole point (CW ODMR). diff gates the
     # switch over window A regardless of this option.
@@ -200,7 +209,8 @@ class OdmrScanInput(FiniteSamplingInputInterface):
 
         # set when the sequence is built
         self._win_time = 0.0             # single count-window duration in s
-        self._windows_per_point = 1      # 1 (sum) | 2 (diff)
+        self._windows_per_point = 1      # 1 (sum) | 2 (diff, norm)
+        self._channel_names = ()         # channels returned per point (set on activation)
 
         # manual laser state (console laser_on()/laser_off()) — preserved across frames
         # and restored at teardown (cycle-1 keep-laser lesson; scanner grading gap).
@@ -216,8 +226,11 @@ class OdmrScanInput(FiniteSamplingInputInterface):
             raise ValueError('accumulate_fraction must be in (0, 1): the low "skip" gaps '
                              'around the count windows are what separates their marker edges '
                              'and closes every window inside its own point block (SCAN-001).')
-        if self._scan_mode not in ('sum', 'diff'):
-            raise ValueError(f'scan_mode must be "sum" or "diff", got "{self._scan_mode}".')
+        if self._scan_mode not in ('sum', 'diff', 'norm'):
+            raise ValueError(f'scan_mode must be "sum", "diff" or "norm", got "{self._scan_mode}".')
+        ref_name = self._reference_channel_name or f'{self._input_channel_name}_ref'
+        if ref_name == self._input_channel_name:
+            raise ValueError('reference_channel_name must differ from input_channel_name.')
         required_ps_keys = {'laser', 'mw', 'detect', 'next'}
         if not required_ps_keys.issubset(self._ps_channels):
             raise ValueError(f'ps_channels must define {sorted(required_ps_keys)}.')
@@ -229,8 +242,13 @@ class OdmrScanInput(FiniteSamplingInputInterface):
             raise ValueError('frame_timeout must be > 0 s, or None for auto (2x frame + 5 s).')
 
         # --- constraints (FiniteSamplingInput carries units + rate/size limits only) ---
+        # The channel set is fixed here: switching into or out of 'norm' needs a reload.
+        if self._scan_mode == 'norm':
+            self._channel_names = (self._input_channel_name, ref_name)
+        else:
+            self._channel_names = (self._input_channel_name,)
         self._constraints = FiniteSamplingInputConstraints(
-            channel_units={self._input_channel_name: 'c/s'},
+            channel_units={ch: 'c/s' for ch in self._channel_names},
             frame_size_limits=(1, int(1e7)),
             sample_rate_limits=(0.1, 1e4)
         )
@@ -279,12 +297,12 @@ class OdmrScanInput(FiniteSamplingInputInterface):
 
         # defaults
         self._sample_rate = float(self._default_sample_rate)
-        self._active_channels = frozenset({self._input_channel_name})
+        self._active_channels = frozenset(self._channel_names)
         self._frame_size = 0
         self._unread = None
         self._consumed = 0
         self._laser_is_on = False
-        self._windows_per_point = 2 if self._scan_mode == 'diff' else 1
+        self._windows_per_point = 1 if self._scan_mode == 'sum' else 2
 
     def on_deactivate(self):
         try:
@@ -478,7 +496,7 @@ class OdmrScanInput(FiniteSamplingInputInterface):
                 raise ValueError(f'Requested {number_of_samples} samples but only '
                                  f'{pending_in_frame} pending in this frame.')
             if number_of_samples == 0 or (number_of_samples is None and pending_in_frame == 0):
-                return {self._input_channel_name: np.empty(0, dtype=np.float64)}
+                return self._empty_samples()
             target = number_of_samples if number_of_samples is not None else 1
 
         # Wait OUTSIDE the lock so stop_buffered_acquisition() can always proceed.
@@ -493,7 +511,7 @@ class OdmrScanInput(FiniteSamplingInputInterface):
                         else available - self._consumed
                     values = self._points_from_windows(self._consumed, n)
                     self._consumed += n
-                    return {self._input_channel_name: values}
+                    return values
                 if time.time() > self._frame_deadline and not self._timed_out:
                     self._log_timeout_diagnostic()
                     # Backstop (SCAN-001): report the frame complete; unclosed windows read
@@ -560,14 +578,19 @@ class OdmrScanInput(FiniteSamplingInputInterface):
     def set_scan_mode(self, mode):
         """ Runtime switch between 'sum' (raw PL, 1 window/point) and 'diff' (mw ON-OFF,
         2 windows/point). Not allowed while a frame is running. NOTE: this changes the
-        MEANING of the streamed values; restart the ODMR scan in the GUI afterwards. """
+        MEANING of the streamed values; restart the ODMR scan in the GUI afterwards.
+        'norm' returns a second channel, so it can only be entered or left through the config
+        (scan_mode) and a module reload: the channel set is fixed at activation. """
         if self.is_running:
             raise RuntimeError('Cannot change scan_mode while acquisition is running.')
-        if mode not in ('sum', 'diff'):
-            raise ValueError(f'scan_mode must be "sum" or "diff", got "{mode}".')
+        if mode not in ('sum', 'diff', 'norm'):
+            raise ValueError(f'scan_mode must be "sum", "diff" or "norm", got "{mode}".')
+        if (mode == 'norm') != (self._scan_mode == 'norm'):
+            raise ValueError('Switching into or out of "norm" changes the channel set: set '
+                             'scan_mode in the config and reload the module instead.')
         with self._thread_lock:
             self._scan_mode = mode
-            self._windows_per_point = 2 if mode == 'diff' else 1
+            self._windows_per_point = 1 if mode == 'sum' else 2
         self.log.info(f'ODMR scan_mode set to "{mode}".')
 
     # ---------------------------------------------------------------- internals
@@ -629,7 +652,7 @@ class OdmrScanInput(FiniteSamplingInputInterface):
         tail_pn = 0 if self._advance_at_start else pn
         usable = T - lead - tail_pn
 
-        if self._scan_mode == 'diff':
+        if self._scan_mode in ('diff', 'norm'):
             half = usable // 2
             rem = usable - 2 * half
             skip = max(1, int(round((1.0 - self._accumulate_fraction) / 2.0 * half)))
@@ -654,7 +677,7 @@ class OdmrScanInput(FiniteSamplingInputInterface):
         else:
             next_ch = pattern([(T - pn, 0), (pn, 1)])
 
-        if self._scan_mode == 'diff':
+        if self._scan_mode in ('diff', 'norm'):
             detect = pattern([(lead + skip, 0), (win, 1), (2 * skip, 0), (win, 1),
                               (skip + rem + tail_pn, 0)])
             mw = pattern([(lead, 0), (half, 1), (half + rem + tail_pn, 0)])
@@ -686,35 +709,41 @@ class OdmrScanInput(FiniteSamplingInputInterface):
         closed_windows = int(np.count_nonzero(self._cbm.getBinWidths()))
         return min(closed_windows // self._windows_per_point, self._frame_size)
 
+    def _empty_samples(self):
+        return {ch: np.empty(0, dtype=np.float64) for ch in self._channel_names}
+
     def _points_from_windows(self, first_point, n_points):
-        """ Convert CountBetweenMarkers windows to per-point c/s values.
+        """ Convert CountBetweenMarkers windows to per-point c/s values, one array per channel.
         sum  (1 window/point):  rate = counts / t_win
         diff (2 windows/point, order A,B per point): rate(A) - rate(B) = (A - B) / t_win
-        (equal windows). Diff values are legitimately NEGATIVE off-resonance noise. """
+        (equal windows). Diff values are legitimately NEGATIVE off-resonance noise.
+        norm (2 windows/point): input channel = rate(A) (mw ON), reference = rate(B). """
         if n_points <= 0:
-            return np.empty(0, dtype=np.float64)
+            return self._empty_samples()
         counts = np.asarray(self._cbm.getData(), dtype=np.float64)
-        if self._scan_mode == 'diff':
+        if self._scan_mode in ('diff', 'norm'):
             a = counts[0::2][first_point:first_point + n_points]
             b = counts[1::2][first_point:first_point + n_points]
-            return (a - b) / self._win_time
-        return counts[first_point:first_point + n_points] / self._win_time
+            if self._scan_mode == 'norm':
+                return {self._channel_names[0]: a / self._win_time,
+                        self._channel_names[1]: b / self._win_time}
+            return {self._input_channel_name: (a - b) / self._win_time}
+        return {self._input_channel_name: counts[first_point:first_point + n_points] / self._win_time}
 
     def _drain_unread(self, number_of_samples):
         """ Post-stop drain (stock contract, SCAN-003): keep returning buffered/empty
         samples after the frame stopped; ValueError only when an explicit request exceeds
         what is left. Called with the thread lock held. """
-        name = self._input_channel_name
-        buffered = np.empty(0, dtype=np.float64) if self._unread is None \
-            else self._unread[name]
+        buffered = self._empty_samples() if self._unread is None else self._unread
+        n_buffered = len(buffered[self._input_channel_name])
         if number_of_samples is None:
-            self._unread = {name: np.empty(0, dtype=np.float64)}
-            return {name: buffered}
-        if number_of_samples > len(buffered):
+            self._unread = self._empty_samples()
+            return buffered
+        if number_of_samples > n_buffered:
             raise ValueError(f'Requested {number_of_samples} samples but only '
-                             f'{len(buffered)} buffered after stop.')
-        self._unread = {name: buffered[number_of_samples:]}
-        return {name: buffered[:number_of_samples]}
+                             f'{n_buffered} buffered after stop.')
+        self._unread = {ch: v[number_of_samples:] for ch, v in buffered.items()}
+        return {ch: v[:number_of_samples] for ch, v in buffered.items()}
 
     def _teardown(self):
         """ Stop everything, leave outputs safe. Snapshot the not-yet-consumed points into
@@ -729,8 +758,8 @@ class OdmrScanInput(FiniteSamplingInputInterface):
             values = self._points_from_windows(self._consumed, n_rest)
         except Exception:
             self.log.exception('Could not snapshot unread samples on teardown:')
-            values = np.empty(0, dtype=np.float64)
-        self._unread = {self._input_channel_name: values}
+            values = self._empty_samples()
+        self._unread = values
         self._consumed = 0
 
         # (2) Pulse Streamer -> between-frames state (keep_laser_on) / all LOW
