@@ -6,6 +6,8 @@
 *.al
 *.libs
 *.so
+# Bundled callback required by the ADLINK fast counter.
+!/src/qudi/hardware/adlink/adlink_callback_functions.so
 *.so.[0-9]*
 *.a
 *.pyc
