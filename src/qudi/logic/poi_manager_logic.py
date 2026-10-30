@@ -428,7 +428,12 @@ class PoiManagerLogic(LogicBase):
     _data_logic = Connector(name='data_logic', interface=ScanningDataLogic)
 
     # config options
-    _scan_axes = tuple(str(ConfigOption('data_scan_axes', default='xy', missing='info')))
+    # confocal_nv fix 2026-10-10 (RUN-CONFOCAL-NV-POI-20261010): the former line
+    #     _scan_axes = tuple(str(ConfigOption('data_scan_axes', default='xy', missing='info')))
+    # converted the ConfigOption OBJECT to a string at class definition, so _scan_axes became a tuple of
+    # the characters of its repr and get_last_history_entry() never found the xy scan image.
+    _scan_axes = ConfigOption('data_scan_axes', default='xy', missing='info',
+                              constructor=lambda x: tuple(str(x)))
 
     # status vars
     _roi = StatusVar(default=RegionOfInterest())  # Notice constructor and representer further below
