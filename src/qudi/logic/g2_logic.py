@@ -320,8 +320,9 @@ class G2Run:
         self._safe_counter_stop()
         if in_refocus and self.refocus is not None:
             try:
-                if self.refocus.busy():
-                    self.refocus.stop()         # our optimize: do not leave it scanning
+                # our optimize: do not leave it scanning. Stopped even if it does not look busy yet: the
+                # queued stop follows the queued start, and stop_optimize on an idle optimizer is a no-op
+                self.refocus.stop()
             except Exception as exc:
                 self.log('error', f'stopping the refocus optimize failed: {exc}')
         self.release_laser()
@@ -603,6 +604,8 @@ class G2Logic(LogicBase):
             ok, message = self._run.start(resume=resume)
             if not ok:
                 self.log.error(f'g2 start {message}')
+                if self._run.restore_pending:
+                    self._timer.start()         # retry the refused laser_off of the failed start
             else:
                 if not resume:
                     self._result = dict()
