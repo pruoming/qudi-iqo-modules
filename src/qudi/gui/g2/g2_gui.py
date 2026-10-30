@@ -290,9 +290,14 @@ class G2Gui(GuiBase):
                   mw.bg_set_button, mw.bg_clear_button):
             w.setEnabled(not active and not background)
         mw.clear_button.setEnabled(not background)
-        mw.stop_button.setEnabled(active)
+        mw.stop_button.setEnabled(active or background)     # Stop also cancels a background measurement
         mw.bin_width.setEnabled(not active)
         mw.n_bins.setEnabled(not active)
+        for box, key in ((mw.bin_width, 'bin_width_ps'), (mw.n_bins, 'n_bins')):
+            if status.get(key) and not box.hasFocus():     # show what the counter applied
+                box.blockSignals(True)
+                box.setValue(int(status[key]))
+                box.blockSignals(False)
         if not mw.run_time.hasFocus():
             mw.run_time.blockSignals(True)
             mw.run_time.setValue(float(status.get('run_time_s', 600.0)))

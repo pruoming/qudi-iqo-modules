@@ -69,6 +69,7 @@ If not, see <https://www.gnu.org/licenses/>.
 """
 
 import datetime
+import re
 import time
 
 import numpy as np
@@ -403,6 +404,11 @@ def evaluate(data, rates, background=None):
     return res
 
 
+def safe_tag(tag):
+    """ A save tag usable in a file name: letters, digits, '-', '_' and '.' only. """
+    return re.sub(r'[^A-Za-z0-9_.-]+', '_', str(tag or '')).strip('_.')
+
+
 def save_g2(root_dir, data, metadata, result, tag='', timestamp=None):
     """ Histogram as a text file (tau_ns, counts, g_norm) with the run and fit in its header, and a png
     (full window and +-50 ns around the dip, with the fit). Returns the data file path. """
@@ -609,6 +615,7 @@ class G2Logic(LogicBase):
             else:
                 if not resume:
                     self._result = dict()
+                    self.sigResultUpdated.emit(dict())      # the GUI drops the old fit
                     self._started_at = datetime.datetime.now()
                 self.log.info(f'g2 run {message} (run time {self._run.run_time_s:.0f} s)')
                 self._timer.start()
@@ -619,6 +626,11 @@ class G2Logic(LogicBase):
             if self._run.active:
                 self._run.stop()
                 self._finish_run()
+            elif self._bg_state is not None:        # Stop also cancels a background measurement
+                self._bg_timer.stop()
+                self._bg_state = None
+                self._run.release_laser()
+                self.log.info('g2 background cancelled')
             self._emit_status()
 
     def _clear(self):
@@ -627,6 +639,7 @@ class G2Logic(LogicBase):
             if self._run.active:
                 self._run.reset_rates()     # rho must describe the same exposure as the histogram
             self._result = dict()
+            self.sigResultUpdated.emit(dict())      # the GUI drops the old fit
             self._emit_data()
 
     def _fit(self):
@@ -643,7 +656,12 @@ class G2Logic(LogicBase):
             # always evaluated afresh: the background or the data may have changed since the last fit
             self._result = evaluate(data, self._run.rate_summary(), self._background)
             self.sigResultUpdated.emit(dict(self._result))
-            path = save_g2(self.module_default_data_dir, data, self._metadata(data), self._result, tag)
+            try:
+                path = save_g2(self.module_default_data_dir, data, self._metadata(data), self._result,
+                               safe_tag(tag))
+            except Exception as exc:
+                self.log.exception(f'g2 save failed: {exc}')
+                return
             self.log.info(f'g2 saved: {path}')
             self.sigSaved.emit(path)
 
@@ -669,6 +687,7 @@ class G2Logic(LogicBase):
                                             int(settings.get('n_bins', self._n_bins)))
                 self._bin_width_ps, self._n_bins = applied['bin_width_ps'], applied['n_bins']
                 self._result = dict()
+                self.sigResultUpdated.emit(dict())      # the GUI drops the old fit
             if 'background_cps' in settings:
                 cps = settings['background_cps']
                 self._background = None if cps is None else dict(

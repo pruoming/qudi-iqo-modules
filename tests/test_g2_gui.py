@@ -81,7 +81,24 @@ class Window(unittest.TestCase):
         self.assertTrue(g._mw.start_button.isEnabled())
         g._apply_saved('C:/x/g2.dat')
         self.assertIn('g2.dat', g._mw.saved_label.text())
+
+        g._apply_result(dict())                            # cleared result: no stale fit
+        self.assertEqual(len(g._mw.zoom_fit.getData()[0] or []), 0)
+        self.assertEqual(g._mw.result_table.item(0, 1).text(), '-')
+        g._apply_result(dict(fit=None, rho=0.5, rho_err=0.01))   # no fit, background only
+        self.assertIn('0.500', g._mw.result_table.item(3, 1).text())
+
+        g._apply_status(dict(phase='finished', background_running=True, bin_width_ps=1000, n_bins=1001))
+        self.assertTrue(g._mw.stop_button.isEnabled())     # Stop cancels the background
+        self.assertFalse(g._mw.start_button.isEnabled())
+        self.assertEqual(g._mw.bin_width.value(), 1000)
         g._mw.close()
+
+    def test_safe_tag(self):
+        from qudi.logic.g2_logic import safe_tag
+        self.assertEqual(safe_tag('B3_-1_2'), 'B3_-1_2')
+        self.assertEqual(safe_tag('a/b:c?'), 'a_b_c')
+        self.assertEqual(safe_tag(''), '')
 
 
 if __name__ == '__main__':
