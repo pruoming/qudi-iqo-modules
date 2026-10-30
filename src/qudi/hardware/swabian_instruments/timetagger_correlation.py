@@ -93,7 +93,8 @@ class TimeTaggerCorrelation(CorrelationCounterInterface):
 
     @property
     def settings(self):
-        return dict(self._settings)
+        with self._lock:
+            return dict(self._settings)
 
     def configure(self, channels, bin_width_ps, n_bins):
         channels = tuple(int(c) for c in channels)
@@ -121,6 +122,7 @@ class TimeTaggerCorrelation(CorrelationCounterInterface):
 
     def start(self):
         with self._lock:
+            self._require_configured()
             self._corr.start()
 
     def stop(self):
@@ -130,10 +132,12 @@ class TimeTaggerCorrelation(CorrelationCounterInterface):
 
     def clear(self):
         with self._lock:
+            self._require_configured()
             self._corr.clear()
 
     def get_data(self):
         with self._lock:
+            self._require_configured()
             tau = np.asarray(self._corr.getIndex(), dtype=np.int64)
             counts = np.asarray(self._corr.getData(), dtype=np.int64)
             g_norm = np.asarray(self._corr.getDataNormalized(), dtype=float)
@@ -142,9 +146,14 @@ class TimeTaggerCorrelation(CorrelationCounterInterface):
 
     def get_count_rates(self):
         with self._lock:
+            self._require_configured()
             rates = np.asarray(self._rate.getData(), dtype=float)
             self._rate.clear()
         return rates
+
+    def _require_configured(self):
+        if self._corr is None or self._rate is None:
+            raise RuntimeError('no correlation set up (configure failed or module inactive)')
 
     def _release(self):
         for m in (self._corr, self._rate):

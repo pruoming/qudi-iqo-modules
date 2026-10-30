@@ -87,6 +87,7 @@ class CorrelationSim:
         self._capture_s = 0.0
         self._norm_rate2 = 0.0
         self._running_since = None
+        self._rate_window = [np.zeros(2), 0.0]
         return dict(self.settings)
 
     def tau_ps(self):
@@ -199,16 +200,22 @@ class CorrelationCounterDummy(CorrelationCounterInterface):
     @property
     def is_running(self):
         with self._lock:
-            return self._sim.is_running
+            return self._sim is not None and self._sim.is_running
 
     @property
     def settings(self):
-        return dict(self._sim.settings)
+        with self._lock:
+            return dict(self._sim.settings) if self._sim is not None else dict()
 
     def configure(self, channels, bin_width_ps, n_bins):
         channels = tuple(int(c) for c in channels)
         if len(channels) != 2 or channels[0] == channels[1]:
             raise ValueError(f'two different channels needed, got {channels}')
+        if not set(channels) <= set(self._constraints.channels):
+            raise ValueError(f'channels {channels} not in {self._constraints.channels}')
+        lo, hi = self._constraints.bin_width_ps
+        if not lo <= int(bin_width_ps) <= hi:
+            raise ValueError(f'bin width {bin_width_ps} ps outside [{lo}, {hi}]')
         if int(n_bins) % 2 == 0 or not 3 <= int(n_bins) <= self._constraints.n_bins[1]:
             raise ValueError(f'number of bins {n_bins} must be odd and within {self._constraints.n_bins}')
         with self._lock:
